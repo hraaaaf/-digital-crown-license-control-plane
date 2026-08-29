@@ -7,6 +7,11 @@ on:
         description: "Type PROVISION to create the production Ed25519 key"
         required: true
         type: string
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/provision.trigger"
 
 permissions:
   contents: read
@@ -17,6 +22,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Confirm explicit production provisioning
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           CONFIRMATION: ${{ inputs.confirmation }}
