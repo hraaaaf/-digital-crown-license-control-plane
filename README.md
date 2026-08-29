@@ -30,13 +30,13 @@ The private signing key is written only to the requested path outside this repos
 
 In **Settings > Secrets and variables > Actions** configure:
 
-Repository secrets:
+Repository secret:
 
 - `DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL`
+
+Repository variables:
+
 - `DIGITALCROWN_LICENSE_SIGNING_KEY_ID`
-
-Repository variable:
-
 - `DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL`
 
 Then manually run **Validate production license signing** once. The workflow verifies the private/public Ed25519 match and performs an in-memory sign/verify test without exporting private material.
