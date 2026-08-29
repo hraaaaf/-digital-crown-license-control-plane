@@ -66,7 +66,7 @@ jobs:
               "X-GitHub-Api-Version": API_VERSION,
           }
 
-          def call(method, path, *, expected, payload=None):
+          def request(method, path, *, expected, payload=None):
               response = requests.request(
                   method,
                   f"{API}{path}",
@@ -78,6 +78,28 @@ jobs:
                   print(f"FAIL: GitHub API {method} {path} returned {response.status_code}.")
                   sys.exit(4)
               return response
+
+          def require_absent(path, label):
+              response = requests.get(f"{API}{path}", headers=headers, timeout=30)
+              if response.status_code == 200:
+                  print(f"REFUSED: {label} already exists. Key rotation requires a separate reviewed procedure.")
+                  sys.exit(5)
+              if response.status_code != 404:
+                  print(f"FAIL: preflight for {label} returned {response.status_code}.")
+                  sys.exit(6)
+
+          require_absent(
+              f"/repos/{repo}/actions/secrets/DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL",
+              "production private signing secret",
+          )
+          require_absent(
+              f"/repos/{repo}/actions/variables/DIGITALCROWN_LICENSE_SIGNING_KEY_ID",
+              "production signing key id",
+          )
+          require_absent(
+              f"/repos/{repo}/actions/variables/DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL",
+              "production public signing key",
+          )
 
           def b64url(data: bytes) -> str:
               return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
@@ -94,7 +116,7 @@ jobs:
           )
           if len(private_raw) != 32 or len(public_raw) != 32:
               print("FAIL: generated Ed25519 raw keys are not 32 bytes.")
-              sys.exit(5)
+              sys.exit(7)
 
           probe = b"digital-crown-sec1-production-key-bootstrap-v1"
           signature = private_key.sign(probe)
@@ -104,7 +126,7 @@ jobs:
           public_value = b64url(public_raw)
           kid = "dc-prod-" + hashlib.sha256(public_raw).hexdigest()[:16]
 
-          key_response = call(
+          key_response = request(
               "GET",
               f"/repos/{repo}/actions/secrets/public-key",
               expected={200},
@@ -114,54 +136,42 @@ jobs:
               SealedBox(repo_public_key).encrypt(private_value.encode("utf-8"))
           ).decode("ascii")
 
-          call(
+          request(
               "PUT",
               f"/repos/{repo}/actions/secrets/DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL",
-              expected={201, 204},
+              expected={201},
               payload={
                   "encrypted_value": encrypted_private,
                   "key_id": key_response["key_id"],
               },
           )
+          request(
+              "POST",
+              f"/repos/{repo}/actions/variables",
+              expected={201},
+              payload={"name": "DIGITALCROWN_LICENSE_SIGNING_KEY_ID", "value": kid},
+          )
+          request(
+              "POST",
+              f"/repos/{repo}/actions/variables",
+              expected={201},
+              payload={
+                  "name": "DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL",
+                  "value": public_value,
+              },
+          )
 
-          def upsert_variable(name, value):
-              probe_response = requests.get(
-                  f"{API}/repos/{repo}/actions/variables/{name}",
-                  headers=headers,
-                  timeout=30,
-              )
-              if probe_response.status_code == 200:
-                  call(
-                      "PATCH",
-                      f"/repos/{repo}/actions/variables/{name}",
-                      expected={204},
-                      payload={"name": name, "value": value},
-                  )
-              elif probe_response.status_code == 404:
-                  call(
-                      "POST",
-                      f"/repos/{repo}/actions/variables",
-                      expected={201},
-                      payload={"name": name, "value": value},
-                  )
-              else:
-                  print(f"FAIL: variable probe for {name} returned {probe_response.status_code}.")
-                  sys.exit(6)
-
-          upsert_variable("DIGITALCROWN_LICENSE_SIGNING_KEY_ID", kid)
-          upsert_variable("DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL", public_value)
-
-          secret_meta = call(
+          secret_meta = request(
               "GET",
               f"/repos/{repo}/actions/secrets/DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL",
               expected={200},
           ).json()
-          kid_meta = call(
+          kid_meta = request(
               "GET",
               f"/repos/{repo}/actions/variables/DIGITALCROWN_LICENSE_SIGNING_KEY_ID",
               expected={200},
           ).json()
-          public_meta = call(
+          public_meta = request(
               "GET",
               f"/repos/{repo}/actions/variables/DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL",
               expected={200},
@@ -169,12 +179,12 @@ jobs:
 
           if secret_meta.get("name") != "DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL":
               print("FAIL: private signing secret metadata readback mismatch.")
-              sys.exit(7)
+              sys.exit(8)
           if kid_meta.get("value") != kid or public_meta.get("value") != public_value:
               print("FAIL: public signing metadata readback mismatch.")
-              sys.exit(8)
+              sys.exit(9)
 
-          call(
+          request(
               "DELETE",
               f"/repos/{repo}/actions/secrets/DC_CONTROL_PLANE_BOOTSTRAP_TOKEN",
               expected={204},
