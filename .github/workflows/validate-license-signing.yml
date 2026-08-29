@@ -9,13 +9,21 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
-      - name: Validate required secrets and Ed25519 keypair
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install crypto dependency
+        run: python -m pip install --disable-pip-version-check cryptography==44.0.1
+
+      - name: Validate required configuration and Ed25519 keypair
         shell: python
         env:
           SIGNING_PRIVATE_KEY: ${{ secrets.DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL }}
-          SIGNING_KEY_ID: ${{ secrets.DIGITALCROWN_LICENSE_SIGNING_KEY_ID }}
+          SIGNING_KEY_ID: ${{ vars.DIGITALCROWN_LICENSE_SIGNING_KEY_ID }}
           PUBLIC_KEY: ${{ vars.DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL }}
         run: |
           import base64
@@ -43,13 +51,17 @@ jobs:
               print("FAIL: signing key material is malformed.")
               sys.exit(3)
 
+          if len(private_raw) != 32 or len(public_raw) != 32:
+              print("FAIL: Ed25519 raw keys must each be exactly 32 bytes.")
+              sys.exit(4)
+
           derived_public = private_key.public_key().public_bytes(
               encoding=serialization.Encoding.Raw,
               format=serialization.PublicFormat.Raw,
           )
           if derived_public != public_raw:
               print("FAIL: configured public key does not match private signing key.")
-              sys.exit(4)
+              sys.exit(5)
 
           message = b"digital-crown-sec1-production-key-validation-v1"
           signature = private_key.sign(message)
@@ -57,7 +69,7 @@ jobs:
               public_key.verify(signature, message)
           except Exception:
               print("FAIL: Ed25519 sign/verify self-test failed.")
-              sys.exit(5)
+              sys.exit(6)
 
           print(f"PASS: Ed25519 production keypair validated; kid={kid}")
           print("PASS: private signing key was not printed or exported.")
