@@ -1,0 +1,6 @@
+# Never commit production signing material.
+*.private.env
+*.pem
+*.key
+private/
+secrets/
