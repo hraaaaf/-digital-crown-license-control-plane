@@ -1,0 +1,17 @@
+name: Runner smoke
+
+on:
+  push:
+    paths:
+      - ".github/runner-smoke.trigger"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Prove runner allocation
+        run: echo runner-ok
