@@ -1,0 +1,63 @@
+name: Validate production license signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Validate required secrets and Ed25519 keypair
+        shell: python
+        env:
+          SIGNING_PRIVATE_KEY: ${{ secrets.DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL }}
+          SIGNING_KEY_ID: ${{ secrets.DIGITALCROWN_LICENSE_SIGNING_KEY_ID }}
+          PUBLIC_KEY: ${{ vars.DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL }}
+        run: |
+          import base64
+          import os
+          import sys
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+          from cryptography.hazmat.primitives import serialization
+
+          def decode_b64url(value: str) -> bytes:
+              padding = "=" * (-len(value) % 4)
+              return base64.urlsafe_b64decode(value + padding)
+
+          private_value = os.environ.get("SIGNING_PRIVATE_KEY", "").strip()
+          kid = os.environ.get("SIGNING_KEY_ID", "").strip()
+          public_value = os.environ.get("PUBLIC_KEY", "").strip()
+          if not private_value or not kid or not public_value:
+              print("FAIL: required production signing configuration is missing.")
+              sys.exit(2)
+          try:
+              private_raw = decode_b64url(private_value)
+              public_raw = decode_b64url(public_value)
+              private_key = Ed25519PrivateKey.from_private_bytes(private_raw)
+              public_key = Ed25519PublicKey.from_public_bytes(public_raw)
+          except Exception:
+              print("FAIL: signing key material is malformed.")
+              sys.exit(3)
+
+          derived_public = private_key.public_key().public_bytes(
+              encoding=serialization.Encoding.Raw,
+              format=serialization.PublicFormat.Raw,
+          )
+          if derived_public != public_raw:
+              print("FAIL: configured public key does not match private signing key.")
+              sys.exit(4)
+
+          message = b"digital-crown-sec1-production-key-validation-v1"
+          signature = private_key.sign(message)
+          try:
+              public_key.verify(signature, message)
+          except Exception:
+              print("FAIL: Ed25519 sign/verify self-test failed.")
+              sys.exit(5)
+
+          print(f"PASS: Ed25519 production keypair validated; kid={kid}")
+          print("PASS: private signing key was not printed or exported.")
