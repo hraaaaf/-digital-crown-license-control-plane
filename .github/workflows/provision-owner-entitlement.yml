@@ -1,0 +1,264 @@
+name: Provision production OWNER entitlement
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PROVISION_OWNER to issue the production OWNER entitlement"
+        required: true
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/owner-provision.trigger"
+
+permissions:
+  contents: read
+
+jobs:
+  provision-owner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Confirm explicit OWNER provisioning
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          test "$CONFIRMATION" = "PROVISION_OWNER" || {
+            echo "FAIL: confirmation must be exactly PROVISION_OWNER"
+            exit 2
+          }
+
+      - name: Check out certified Digital Crown SEC-1 code
+        uses: actions/checkout@v4
+        with:
+          repository: hraaaaf/Digital_crown
+          ref: 7c902592ab9f091c1a970289771417499aea67d5
+          path: app
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned control-plane dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          cryptography==46.0.5
+          firebase-admin==7.5.0
+          pydantic==2.6.3
+          pydantic-settings==2.2.1
+          python-dotenv==1.2.1
+
+      - name: Issue, persist and verify OWNER entitlement
+        shell: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/app
+          PLATFORM_CONTROL_PLANE_ENABLED: "true"
+          SUPERADMIN_USER_ID: ${{ vars.DIGITALCROWN_SUPERADMIN_USER_ID }}
+          OWNER_CABINET_ID: ${{ vars.DIGITALCROWN_OWNER_CABINET_ID }}
+          DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL: ${{ secrets.DIGITALCROWN_LICENSE_SIGNING_PRIVATE_KEY_B64URL }}
+          DIGITALCROWN_LICENSE_SIGNING_KEY_ID: ${{ vars.DIGITALCROWN_LICENSE_SIGNING_KEY_ID }}
+          DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL: ${{ vars.DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.DIGITALCROWN_FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from firebase_admin import credentials, firestore, initialize_app
+
+          from backend.license_issuer import issue_license
+          from backend.license_security import LicenseSecurityError, verify_license
+          from backend.license_trust import TRUSTED_LICENSE_PUBLIC_KEYS
+
+          def fail(message: str, code: int) -> None:
+              print(f"FAIL: {message}")
+              raise SystemExit(code)
+
+          owner_raw = os.environ.get("SUPERADMIN_USER_ID", "").strip()
+          cabinet_id = os.environ.get("OWNER_CABINET_ID", "").strip()
+          kid = os.environ.get("DIGITALCROWN_LICENSE_SIGNING_KEY_ID", "").strip()
+          public_key = os.environ.get("DIGITALCROWN_LICENSE_SIGNING_PUBLIC_KEY_B64URL", "").strip()
+          firebase_raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+
+          try:
+              owner_user_id = int(owner_raw)
+          except (TypeError, ValueError):
+              fail("DIGITALCROWN_SUPERADMIN_USER_ID must be a positive integer.", 3)
+          if owner_user_id <= 0:
+              fail("DIGITALCROWN_SUPERADMIN_USER_ID must be a positive integer.", 3)
+          if not cabinet_id:
+              fail("DIGITALCROWN_OWNER_CABINET_ID is missing.", 4)
+          if not kid or not public_key:
+              fail("production signing key id/public key variables are missing.", 5)
+          if not firebase_raw:
+              fail("DIGITALCROWN_FIREBASE_SERVICE_ACCOUNT_JSON is missing.", 6)
+
+          if TRUSTED_LICENSE_PUBLIC_KEYS.get(kid) != public_key:
+              fail("control-plane public key does not match certified client trust anchor.", 7)
+
+          try:
+              service_account = json.loads(firebase_raw)
+              if not isinstance(service_account, dict):
+                  raise ValueError("not an object")
+          except Exception:
+              fail("Firebase service account JSON is malformed.", 8)
+
+          try:
+              initialize_app(credentials.Certificate(service_account))
+          except ValueError:
+              pass
+          db = firestore.client()
+          doc_ref = db.collection("licenses").document(cabinet_id)
+          existing = doc_ref.get()
+          now = datetime.now(timezone.utc)
+          trusted = {kid: public_key}
+
+          if existing.exists:
+              data = existing.to_dict() or {}
+              existing_signed = data.get("signed_license")
+              if not isinstance(existing_signed, str) or not existing_signed:
+                  fail("existing unsigned/legacy license requires reviewed migration; OWNER overwrite refused.", 9)
+              try:
+                  current = verify_license(
+                      existing_signed,
+                      trusted,
+                      expected_cabinet_id=cabinet_id,
+                      now=now,
+                  )
+              except LicenseSecurityError:
+                  fail("existing signed license is invalid; OWNER overwrite refused.", 10)
+              if not (
+                  current.license_type == "OWNER"
+                  and current.status == "ACTIVE"
+                  and current.subject_user_id == owner_user_id
+                  and current.expires_at is None
+                  and current.claims.get("feature_set") == "ELITE"
+                  and current.claims.get("max_devices") is None
+              ):
+                  fail("existing valid license is not the exact OWNER entitlement; overwrite refused.", 11)
+              verified = current
+              signed_license = existing_signed
+              applied = False
+          else:
+              signed_license = issue_license(
+                  cabinet_id=cabinet_id,
+                  license_type="OWNER",
+                  created_by_user_id=owner_user_id,
+                  expires_at=None,
+                  release_channel="stable",
+                  feature_set="ELITE",
+                  max_devices=None,
+                  status="ACTIVE",
+                  subject_user_id=owner_user_id,
+              )
+              try:
+                  verified = verify_license(
+                      signed_license,
+                      trusted,
+                      expected_cabinet_id=cabinet_id,
+                      now=now,
+                  )
+              except LicenseSecurityError:
+                  fail("new OWNER token failed local trust verification.", 12)
+
+              if not (
+                  verified.license_type == "OWNER"
+                  and verified.status == "ACTIVE"
+                  and verified.subject_user_id == owner_user_id
+                  and verified.expires_at is None
+                  and verified.claims.get("feature_set") == "ELITE"
+                  and verified.claims.get("max_devices") is None
+              ):
+                  fail("new OWNER claims failed policy validation.", 13)
+
+              doc_ref.set(
+                  {
+                      "signed_license": signed_license,
+                      "active": True,
+                      "expiration_date": None,
+                      "license_type": "OWNER",
+                      "feature_set": "ELITE",
+                      "release_channel": "stable",
+                      "license_id": verified.license_id,
+                      "key_id": verified.key_id,
+                  },
+                  merge=True,
+              )
+              applied = True
+
+          read_back = doc_ref.get()
+          if not read_back.exists:
+              fail("Firebase OWNER read-back is missing.", 14)
+          read_data = read_back.to_dict() or {}
+          read_signed = read_data.get("signed_license")
+          if not isinstance(read_signed, str) or not read_signed:
+              fail("Firebase OWNER read-back has no signed token.", 15)
+
+          try:
+              read_verified = verify_license(
+                  read_signed,
+                  trusted,
+                  expected_cabinet_id=cabinet_id,
+                  now=datetime.now(timezone.utc),
+              )
+          except LicenseSecurityError:
+              fail("Firebase OWNER read-back failed signature verification.", 16)
+
+          if not (
+              read_verified.license_id == verified.license_id
+              and read_verified.license_type == "OWNER"
+              and read_verified.status == "ACTIVE"
+              and read_verified.subject_user_id == owner_user_id
+              and read_verified.expires_at is None
+              and read_verified.claims.get("feature_set") == "ELITE"
+              and read_verified.claims.get("max_devices") is None
+              and read_verified.key_id == kid
+          ):
+              fail("Firebase OWNER read-back claims mismatch.", 17)
+
+          evidence = {
+              "ok": True,
+              "applied": applied,
+              "already_provisioned": not applied,
+              "owner_user_id": owner_user_id,
+              "cabinet_id": cabinet_id,
+              "license_id": read_verified.license_id,
+              "license_type": "OWNER",
+              "feature_set": "ELITE",
+              "release_channel": "stable",
+              "expires_at": None,
+              "max_devices": None,
+              "key_id": read_verified.key_id,
+              "firebase_readback_verified": True,
+              "signed_token_sha256": hashlib.sha256(read_signed.encode("utf-8")).hexdigest(),
+              "client_trust_anchor_match": True,
+              "digital_crown_head": "7c902592ab9f091c1a970289771417499aea67d5",
+          }
+          Path("owner-evidence").mkdir(exist_ok=True)
+          Path("owner-evidence/owner-entitlement.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+          print(
+              "PASS: OWNER entitlement verified in Firebase; "
+              f"owner_user_id={owner_user_id}; cabinet_id={cabinet_id}; "
+              f"license_id={read_verified.license_id}; kid={read_verified.key_id}; "
+              f"applied={applied}"
+          )
+          print("PASS: signed token and private signing key were not printed or artifacted.")
+
+      - name: Upload non-secret OWNER evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sec1-owner-entitlement-evidence
+          path: owner-evidence/owner-entitlement.json
+          if-no-files-found: error
+          retention-days: 30
